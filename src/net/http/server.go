@@ -164,6 +164,8 @@ type ResponseWriter interface {
 // if the client is connected through an HTTP proxy,
 // the buffered data may not reach the client until the response
 // completes.
+
+// 客户端如果使用了http代理，原有的flush功能将可能只会在响应完成以后才会flush
 type Flusher interface {
 	// Flush sends any buffered data to the client.
 	Flush()
@@ -935,7 +937,10 @@ func appendTime(b []byte, t time.Time) []byte {
 var errTooLarge = errors.New("http: request too large")
 
 // Read next request from connection.
+// 从连接中获取请求的信息
 func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
+
+	// 如果请求被劫持，则抛出错误
 	if c.hijacked() {
 		return nil, ErrHijacked
 	}
@@ -945,6 +950,8 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		hdrDeadline      time.Time // or zero if none
 	)
 	t0 := time.Now()
+
+	// 获取服务器设置的读 超时设置和 写 超时设置
 	if d := c.server.readHeaderTimeout(); d != 0 {
 		hdrDeadline = t0.Add(d)
 	}
@@ -958,12 +965,18 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		}()
 	}
 
+	// 读取服务器设置的允许读大小
 	c.r.setReadLimit(c.server.initialReadLimitSize())
+
 	if c.lastMethod == "POST" {
+
+		// 如果客户端使用的是POST方法，需要对RFC 7230中 旧的客户端进行适应
 		// RFC 7230 section 3 tolerance for old buggy clients.
 		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
 		c.bufr.Discard(numLeadingCRorLF(peek))
 	}
+
+	// 读取request参数
 	req, err := readRequest(c.bufr, keepHostHeader)
 	if err != nil {
 		if c.r.hitReadLimit() {
@@ -972,6 +985,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 		return nil, err
 	}
 
+	// 确认是否是http/1.x 能够处理的类型，因为当前的函数是c.serve 中给HTTP/1.x 服务的
 	if !http1ServerSupportsRequest(req) {
 		return nil, badRequestError("unsupported protocol version")
 	}
@@ -984,12 +998,16 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if req.ProtoAtLeast(1, 1) && (!haveHost || len(hosts) == 0) && !isH2Upgrade && req.Method != "CONNECT" {
 		return nil, badRequestError("missing required Host header")
 	}
+
+	// 如果request中的 header 中的Host超过两个是   不合法的
 	if len(hosts) > 1 {
 		return nil, badRequestError("too many Host headers")
 	}
 	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
 		return nil, badRequestError("malformed Host header")
 	}
+
+	// 校验所有的header设置是否合法
 	for k, vv := range req.Header {
 		if !httpguts.ValidHeaderFieldName(k) {
 			return nil, badRequestError("invalid header name")
@@ -1006,6 +1024,8 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	req.ctx = ctx
 	req.RemoteAddr = c.remoteAddr
 	req.TLS = c.tlsState
+
+	// 获取请求的请求体
 	if body, ok := req.Body.(*body); ok {
 		body.doEarlyClose = true
 	}
@@ -1014,7 +1034,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if !hdrDeadline.Equal(wholeReqDeadline) {
 		c.rwc.SetReadDeadline(wholeReqDeadline)
 	}
-
+	// 创建一个response
 	w = &response{
 		conn:          c,
 		cancelCtx:     cancelCtx,
@@ -1759,14 +1779,23 @@ func isCommonNetReadError(err error) bool {
 }
 
 // Serve a new connection.
+// 处理某一个链接的具体逻辑
 func (c *conn) serve(ctx context.Context) {
-	c.remoteAddr = c.rwc.RemoteAddr().String()
+	// 在http的serve中建立新的协程来处理请求的同时，会把上下文传给当前协程
+	c.remoteAddr = c.rwc.RemoteAddr().String()   // 获取客户端的地址
+	// 得到具体的上下文
 	ctx = context.WithValue(ctx, LocalAddrContextKey, c.rwc.LocalAddr())
+
+	// 发生错误时，利用匿名函数来善后
 	defer func() {
+		// 在defer中调用recover来阻止默认的panic，这里用来打印日志
 		if err := recover(); err != nil && err != ErrAbortHandler {
+
+			// 创建一个64KB大小的buf
 			const size = 64 << 10
 			buf := make([]byte, size)
 			buf = buf[:runtime.Stack(buf, false)]
+			// 将缓存区中的运行时堆栈信息打印日志文件中
 			c.server.logf("http: panic serving %v: %v\n%s", c.remoteAddr, err, buf)
 		}
 		if !c.hijacked() {
@@ -1807,11 +1836,16 @@ func (c *conn) serve(ctx context.Context) {
 
 	// HTTP/1.x from here on.
 
+	// 处理HTTP/1.x 的请求
+
 	ctx, cancelCtx := context.WithCancel(ctx)
 	c.cancelCtx = cancelCtx
 	defer cancelCtx()
 
+	// request reader
 	c.r = &connReader{conn: c}
+
+	// 创建一个Bufio Reader
 	c.bufr = newBufioReader(c.r)
 	c.bufw = newBufioWriterSize(checkConnErrorWriter{c}, 4<<10)
 
@@ -2562,6 +2596,7 @@ func (s *Server) getDoneChan() <-chan struct{} {
 	return s.getDoneChanLocked()
 }
 
+// 这里有点像单例模式
 func (s *Server) getDoneChanLocked() chan struct{} {
 	if s.doneChan == nil {
 		s.doneChan = make(chan struct{})
@@ -2835,6 +2870,8 @@ var ErrServerClosed = errors.New("http: Server closed")
 //
 // Serve always returns a non-nil error and closes l.
 // After Shutdown or Close, the returned error is ErrServerClosed.
+
+// 返回一个非nil的错误和listener
 func (srv *Server) Serve(l net.Listener) error {
 	if fn := testHookServerServe; fn != nil {
 		fn(srv, l) // call hook with unwrapped listener
@@ -2847,22 +2884,27 @@ func (srv *Server) Serve(l net.Listener) error {
 		return err
 	}
 
+	// 添加一个需要track的监听器
 	if !srv.trackListener(&l, true) {
 		return ErrServerClosed
 	}
+	// 如果失败，则将改监听器取消track
 	defer srv.trackListener(&l, false)
 
 	var tempDelay time.Duration     // how long to sleep on accept failure
 	baseCtx := context.Background() // base is always background, per Issue 16220
+	// 得到上下文
 	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
 	for {
 		rw, e := l.Accept()
+		// 开始建立监听，等待客户端请求
 		if e != nil {
 			select {
 			case <-srv.getDoneChan():
 				return ErrServerClosed
 			default:
 			}
+			// 尝试重新建立连接
 			if ne, ok := e.(net.Error); ok && ne.Temporary() {
 				if tempDelay == 0 {
 					tempDelay = 5 * time.Millisecond
@@ -2878,10 +2920,11 @@ func (srv *Server) Serve(l net.Listener) error {
 			}
 			return e
 		}
+		// 如果进入accept之后没有错误，直接建立新的连接
 		tempDelay = 0
 		c := srv.newConn(rw)
 		c.setState(c.rwc, StateNew) // before Serve can return
-		go c.serve(ctx)
+		go c.serve(ctx)  // 在协程中进行处理，同时将上下文传递给了c.serve
 	}
 }
 
@@ -2898,18 +2941,30 @@ func (srv *Server) Serve(l net.Listener) error {
 //
 // ServeTLS always returns a non-nil error. After Shutdown or Close, the
 // returned error is ErrServerClosed.
+
+// 安全传输层协议（TLS）用于在两个通信应用程序之间提供保密性和数据完整性。
+// 应用于需要证书的服务
+
 func (srv *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
 	// Setup HTTP/2 before srv.Serve, to initialize srv.TLSConfig
 	// before we clone it and create the TLS Listener.
+
+	// 使用HTTP2建立TLS连接
 	if err := srv.setupHTTP2_ServeTLS(); err != nil {
 		return err
 	}
 
+	// 获取配置
 	config := cloneTLSConfig(srv.TLSConfig)
+
+	// NextProtos is a list of supported, application level protocols
+	// 从配置的NextProtos中判断当前支持的协议中是否包含http/1.1
+	// 如果不包含，则将http/1.1加入config中
 	if !strSliceContains(config.NextProtos, "http/1.1") {
 		config.NextProtos = append(config.NextProtos, "http/1.1")
 	}
 
+	// 检查有没有配置证书，没有配置证书，则打印响应的错误
 	configHasCert := len(config.Certificates) > 0 || config.GetCertificate != nil
 	if !configHasCert || certFile != "" || keyFile != "" {
 		var err error
@@ -2920,6 +2975,7 @@ func (srv *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
 		}
 	}
 
+	// 创建一个新的TLS 监听器
 	tlsListener := tls.NewListener(l, config)
 	return srv.Serve(tlsListener)
 }
@@ -2934,12 +2990,17 @@ func (srv *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
 // Listener from another caller.
 //
 // It reports whether the server is still up (not Shutdown or Closed).
+
+// 此函数用于添加listener
 func (s *Server) trackListener(ln *net.Listener, add bool) bool {
+	// 并发下， 需要使用锁来控制线程安全
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// 如果是第一个需要被track的监听器，则需要初始化map
 	if s.listeners == nil {
 		s.listeners = make(map[*net.Listener]struct{})
 	}
+	// 如果是true, 则执行添加，如果是false，则执行删除
 	if add {
 		if s.shuttingDown() {
 			return false
@@ -2951,6 +3012,8 @@ func (s *Server) trackListener(ln *net.Listener, add bool) bool {
 	return true
 }
 
+
+//
 func (s *Server) trackConn(c *conn, add bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
